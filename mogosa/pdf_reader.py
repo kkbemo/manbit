@@ -153,12 +153,13 @@ def _column_of(word: dict, boundaries: list[float]) -> int:
     return len(boundaries)
 
 
-def _collect_boxes(page) -> list[tuple[float, float, float, float]]:
+def _collect_boxes(page, boundaries: list[float] | None = None) -> list[tuple[float, float, float, float]]:
     """페이지에 그려진 사각형 테두리를 모은다.
 
     한글/평가원 PDF는 상자를 rect 하나로 그리기도 하고, 선 네 개로 그리기도
     한다. 둘 다 받는다.
     """
+    boundaries = boundaries or []
     boxes: list[tuple[float, float, float, float]] = []
 
     for rect in page.rects:
@@ -167,15 +168,54 @@ def _collect_boxes(page) -> list[tuple[float, float, float, float]]:
         if width > page.width * 0.15 and height > 8:
             boxes.append((rect["x0"], rect["top"], rect["x1"], rect["bottom"]))
 
-    # 선분으로 그린 상자 복원: 가로선 두 개가 x범위를 공유하면 상자로 본다
-    horizontals = [
-        l for l in page.lines if abs(l["bottom"] - l["top"]) < 2 and (l["x1"] - l["x0"]) > page.width * 0.15
-    ]
+    # 선분으로 그린 상자 복원: 가로선 두 개가 x범위를 공유하면 상자로 본다.
+    #
+    # 짝지은 두 선은 반드시 둘 다 써 버려야 한다. 아랫변을 다음 상자의
+    # 윗변으로 다시 쓰면, 상자와 상자 사이(선택지가 있는 자리)를 감싸는
+    # 유령 상자가 생겨서 선택지가 통째로 상자 안으로 먹힌다.
+    # 평가원의 보기 상자는 윗변이 `───<보 기>───` 처럼 라벨 좌우로 끊겨
+    # 있다. 두 토막을 이어 붙여야 온전한 테두리가 된다. 붙이지 않으면
+    # 상자 짝이 하나씩 밀려서 선택지가 상자 안으로 먹힌다.
+    # 이을 자격이 있는 토막만 추린다. 그림(벤다이어그램 따위) 속 짧은
+    # 선분들이 같은 높이에서 합쳐지면 있지도 않은 테두리가 생겨서,
+    # 그 아래 선택지가 상자 안으로 먹힌다.
+    # 보기 라벨 좌우 장식선은 단 폭의 절반쯤 되므로 이 기준을 넘는다.
+    min_segment_width = page.width * 0.10
+    segments = _dedupe_lines(
+        l for l in page.lines
+        if abs(l["bottom"] - l["top"]) < 2 and (l["x1"] - l["x0"]) >= min_segment_width
+    )
+    horizontals = _merge_segments_within_columns(segments, boundaries, page.width)
+    horizontals = [l for l in horizontals if (l["x1"] - l["x0"]) > page.width * 0.25]
     horizontals.sort(key=lambda l: l["top"])
+
+    # 상자 높이의 아래위 한계.
+    #
+    # 아래 한계가 중요하다. 보기 상자는 윗변 바로 밑(16pt쯤)에 `<보 기>`
+    # 라벨 장식선을 하나 더 긋는데, 그 둘이 짝지어지면 납작한 가짜 상자가
+    # 생기고 진짜 아랫변이 짝을 잃는다. 그러면 그 아랫변이 한참 밑의
+    # 다른 선과 짝지어져 다음 문항까지 통째로 삼킨다.
+    min_box_height = 25.0
+    max_box_height = page.height * 0.5
+
+    used: set[int] = set()
     for i, top_line in enumerate(horizontals):
-        for bottom_line in horizontals[i + 1:]:
-            if bottom_line["top"] - top_line["top"] < 10:
+        if i in used:
+            continue
+        # 이미 만들어진 상자 **안쪽**에 있는 선은 테두리가 아니다.
+        # 보기 상자의 `<보 기>` 라벨 장식선이 여기 걸린다. 걸러 내지 않으면
+        # 저 아래 다른 문항의 장식선과 짝지어 거대한 유령 상자를 만든다.
+        if _inside_any_box(top_line, boxes):
+            continue
+        for j in range(i + 1, len(horizontals)):
+            if j in used:
                 continue
+            bottom_line = horizontals[j]
+            height = bottom_line["top"] - top_line["top"]
+            if height < min_box_height:
+                continue
+            if height > max_box_height:
+                break  # 이만큼 키가 큰 상자는 없다. 잘못 짝지은 것이다.
             overlap = min(top_line["x1"], bottom_line["x1"]) - max(top_line["x0"], bottom_line["x0"])
             if overlap > (top_line["x1"] - top_line["x0"]) * 0.8:
                 candidate = (
@@ -186,9 +226,128 @@ def _collect_boxes(page) -> list[tuple[float, float, float, float]]:
                 )
                 if not _overlaps_existing(candidate, boxes):
                     boxes.append(candidate)
+                used.add(i)
+                used.add(j)
                 break
 
     return boxes
+
+
+def _inside_any_box(line: dict, boxes: list[tuple], margin: float = 3.0) -> bool:
+    """이 가로선이 이미 잡힌 상자의 안쪽에 있는가 (테두리가 아니라)."""
+    y = line["top"]
+    for x0, top, x1, bottom in boxes:
+        if top + margin < y < bottom - margin and x0 - margin <= line["x0"] and line["x1"] <= x1 + margin:
+            return True
+    return False
+
+
+def _merge_segments_within_columns(
+    segments: list[dict],
+    boundaries: list[float],
+    page_width: float,
+    *,
+    y_tolerance: float = 1.5,
+    max_gap: float = 120.0,
+) -> list[dict]:
+    """같은 높이에 끊겨 그려진 가로 토막을 이어 붙인다.
+
+    반드시 **단 안에서만** 잇는다. 평가원 A3 지면은 단 사이 간격이 42pt인데
+    보기 라벨 좌우 간격이 45pt라, 단을 넘어 이으면 좌우 단의 테두리가
+    한 줄로 붙어 버린다.
+    """
+    edges = [0.0, *boundaries, page_width]
+    result: list[dict] = []
+
+    for index in range(len(edges) - 1):
+        left, right = edges[index], edges[index + 1]
+        inside = [s for s in segments if s["x0"] >= left - 2 and s["x1"] <= right + 2]
+
+        rows: dict[int, list[dict]] = {}
+        for segment in inside:
+            rows.setdefault(round(segment["top"] / y_tolerance), []).append(segment)
+
+        for row in rows.values():
+            row.sort(key=lambda s: s["x0"])
+            current = dict(row[0])
+            for segment in row[1:]:
+                if segment["x0"] - current["x1"] <= max_gap:
+                    current["x1"] = max(current["x1"], segment["x1"])
+                else:
+                    result.append(current)
+                    current = dict(segment)
+            result.append(current)
+
+    return result
+
+
+def _dedupe_lines(lines) -> list[dict]:
+    """같은 자리에 겹쳐 그려진 선분을 하나로 친다.
+
+    한글에서 만든 PDF는 테두리를 두 번씩 그리는 일이 흔하다.
+    """
+    seen: set[tuple] = set()
+    result = []
+    for line in lines:
+        key = (round(line["x0"]), round(line["x1"]), round(line["top"]), round(line["bottom"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(line)
+    return result
+
+
+def _body_region(page) -> tuple[float, float, float, float] | None:
+    """본문이 차지하는 네모(왼쪽, 위, 오른쪽, 아래)를 찾는다.
+
+    평가원 문제지에는 두 가지 표시가 있어서 본문 범위를 정확히 알 수 있다.
+        - 단과 단 사이의 세로 구분선 -> 본문의 위아래 끝
+        - 머리말 아래의 긴 가로줄     -> 본문의 좌우 끝
+
+    이걸 쓰면 시험명·성명·수험번호 칸, 쪽번호, 저작권 표시, 그리고 오른쪽
+    가장자리에 세로로 박아 놓은 과목명 탭까지 한꺼번에 걷어낼 수 있다.
+    세로 탭은 글자 하나하나가 똑바로 서 있어서 회전 여부로는 걸러지지 않고,
+    그대로 두면 "사", "상" 같은 조각이 본문 문장에 끼어든다.
+
+    표시가 없는 PDF도 있으므로 못 찾으면 None을 돌려준다.
+    """
+    top = bottom = left = right = None
+
+    verticals = [
+        obj for obj in list(page.lines) + list(page.rects)
+        if (obj["x1"] - obj["x0"]) < 3 and (obj["bottom"] - obj["top"]) > page.height * 0.4
+    ]
+    if verticals:
+        top = min(v["top"] for v in verticals)
+        bottom = max(v["bottom"] for v in verticals)
+
+    rules = [
+        obj for obj in list(page.lines) + list(page.rects)
+        if (obj["x1"] - obj["x0"]) > page.width * 0.5
+        and (obj["bottom"] - obj["top"]) < page.height * 0.5
+    ]
+    if rules:
+        left = min(r["x0"] for r in rules)
+        right = max(r["x1"] for r in rules)
+
+        # 첫 쪽에는 시험명 아래에 성명·수험번호 칸이 있고, 그 칸의 아래
+        # 가로줄이 곧 본문의 시작이다. 세로 구분선은 그 칸 위쪽부터
+        # 그어져 있어서 그것만 믿으면 "제[ ] 선택" 같은 조각이 본문에
+        # 섞여 들어온다. 머리말 영역에 있는 가로줄 중 가장 아래를 쓴다.
+        header_rules = [r["bottom"] for r in rules if r["top"] < page.height * 0.25]
+        if header_rules:
+            deepest = max(header_rules)
+            top = deepest if top is None else max(top, deepest)
+
+    if top is None and left is None:
+        return None
+
+    return (
+        left if left is not None else 0.0,
+        top if top is not None else 0.0,
+        right if right is not None else page.width,
+        bottom if bottom is not None else page.height,
+    )
 
 
 def _overlaps_existing(candidate, boxes) -> bool:
@@ -199,11 +358,27 @@ def _overlaps_existing(candidate, boxes) -> bool:
     return False
 
 
-def _looks_like_running_head(line: TextLine, page_height: float) -> bool:
+def _looks_like_running_head(
+    line: TextLine,
+    page_height: float,
+    body: tuple[float, float] | None = None,
+) -> bool:
     """머리말/꼬리말인지 판단한다."""
     text = line.text.strip()
     if not text:
         return True
+
+    # 본문 네모를 알아냈다면 그 바깥은 전부 머리말·꼬리말이다.
+    # 시험명, 성명·수험번호 칸, 쪽번호, 저작권 표시가 여기서 걸린다.
+    if body is not None:
+        body_left, body_top, body_right, body_bottom = body
+        center_y = (line.top + line.bottom) / 2
+        center_x = (line.x0 + line.x1) / 2
+        return not (
+            body_top - 4 <= center_y <= body_bottom + 4
+            and body_left - 4 <= center_x <= body_right + 4
+        )
+
     near_top = line.top < page_height * 0.07
     near_bottom = line.bottom > page_height * 0.93
     if not (near_top or near_bottom):
@@ -349,13 +524,18 @@ def load_lines(
     with pdfplumber.open(str(pdf_path)) as pdf:
         report.pages = len(pdf.pages)
         for page_number, page in enumerate(pdf.pages, start=1):
+            # 옆면 세로 탭("윤리와 사상")처럼 눕혀 놓은 글자는 본문이 아니다.
+            # 그대로 두면 낱글자가 본문 줄에 섞여 들어가 문장을 망친다.
+            page = page.filter(lambda obj: obj.get("upright", True) is not False)
+
             words = page.extract_words(keep_blank_chars=False, use_text_flow=False,
                                        extra_attrs=["size"])
             if not words:
                 continue
 
+            body = _body_region(page)
             boundaries = _detect_column_split(words, page.width, columns)
-            boxes = _collect_boxes(page)
+            boxes = _collect_boxes(page, boundaries)
             report.boxes_found += len(boxes)
 
             regions: list[FigureRegion] = (
@@ -368,7 +548,11 @@ def load_lines(
 
             # 단마다 잘라서 pdfplumber의 줄 조립기를 그대로 쓴다.
             # 직접 단어를 잇는 것보다 한글 자간 처리가 정확하다.
-            edges = [0.0, *boundaries, page.width]
+            # 본문 좌우 끝을 알면 그 안에서만 단을 자른다. 이렇게 해야
+            # 가장자리 세로 탭 글자가 본문 줄에 합쳐지기 전에 빠진다.
+            page_left = body[0] if body else 0.0
+            page_right = body[2] if body else page.width
+            edges = [page_left, *boundaries, page_right]
             for column in range(len(edges) - 1):
                 left_edge, right_edge = edges[column], edges[column + 1]
                 entries: list[tuple[float, TextLine]] = []
@@ -392,7 +576,7 @@ def load_lines(
                         page=page_number,
                         column=column,
                     )
-                    if _looks_like_running_head(line, page.height):
+                    if _looks_like_running_head(line, page.height, body):
                         report.dropped_running_heads.append(line.text)
                         continue
 
