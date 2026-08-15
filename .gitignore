@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/fixture_exam.pdf
+*.hwpx
+!mogosa/templates/*.hwpx

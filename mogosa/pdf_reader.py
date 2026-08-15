@@ -1,0 +1,514 @@
+"""평가원 모의고사 PDF -> Exam(IR).
+
+PDF에는 "이건 발문", "이건 보기 상자" 같은 정보가 전혀 없다. 있는 것은
+글자와 좌표, 그리고 그려진 선분뿐이다. 그래서 순서가 이렇게 된다.
+
+    1. 단(column) 경계를 찾아 좌/우 단을 나눈다
+    2. 같은 y좌표의 글자들을 줄로 묶는다
+    3. 머리말/꼬리말(과목명, 쪽번호)을 걷어낸다
+    4. 그려진 사각형 안에 들어간 줄을 상자 내용으로 표시한다
+    5. 줄 흐름을 상태 기계로 훑어 문항 단위로 자른다
+
+레이아웃 추론이라 100% 확신할 수는 없다. 애매한 지점은 그냥 넘기지 않고
+Exam.validate()에 걸리도록 두어서, 사람이 확인할 거리를 남긴다.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pdfplumber
+
+from .model import CHOICE_MARKS, Box, Exam, Question
+
+# 문항 시작: "1." "12." "1 ." 등
+RE_QUESTION_START = re.compile(r"^(\d{1,3})\s*[.．]\s*(.*)$")
+# 배점: "[3점]" "[ 3점 ]"
+RE_POINTS = re.compile(r"\[\s*(\d)\s*점\s*\]")
+# 보기 상자 라벨: "<보기>", "< 보 기 >", "〈보 기〉"
+RE_BOGI_LABEL = re.compile(r"^[<〈][\s]*보[\s]*기[\s]*[>〉]$")
+# 쪽번호만 있는 줄
+RE_PAGE_NUMBER = re.compile(r"^\d{1,3}$")
+# 머리말/꼬리말에 흔히 나오는 조각
+RE_RUNNING_HEAD = re.compile(
+    r"(영\s*역|홀수형|짝수형|제\s*\d\s*교시|이\s*책은|무단\s*전재)"
+)
+
+CHOICE_MARK_SET = set(CHOICE_MARKS)
+CHOICE_SPLIT = re.compile(f"([{''.join(CHOICE_MARKS)}])")
+
+
+@dataclass
+class TextLine:
+    """PDF에서 뽑아낸 한 줄."""
+
+    text: str
+    x0: float
+    x1: float
+    top: float
+    bottom: float
+    size: float
+    page: int
+    column: int
+    box_id: int | None = None
+
+    @property
+    def in_box(self) -> bool:
+        return self.box_id is not None
+
+
+@dataclass
+class ParseReport:
+    """파싱 과정에서 사람이 확인해야 할 것들."""
+
+    pages: int = 0
+    lines: int = 0
+    dropped_running_heads: list[str] = field(default_factory=list)
+    boxes_found: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [
+            f"{self.pages}쪽 / {self.lines}줄 / 상자 {self.boxes_found}개",
+        ]
+        if self.dropped_running_heads:
+            parts.append(f"머리말·꼬리말 {len(self.dropped_running_heads)}줄 제거")
+        return " · ".join(parts)
+
+
+# ----------------------------------------------------------------------
+# 1~4단계: 레이아웃 -> 줄 목록
+# ----------------------------------------------------------------------
+
+
+def _detect_column_split(words: list[dict], page_width: float, columns: int) -> list[float]:
+    """단 사이 빈 띠(gutter)를 찾아 경계 x좌표를 돌려준다.
+
+    단순히 페이지 폭을 반으로 자르면, 여백이 비대칭이거나 표가 단을 걸칠 때
+    틀린다. 실제로 글자가 없는 세로 띠를 찾아서 그 중앙을 경계로 삼는다.
+    """
+    if columns <= 1 or not words:
+        return []
+
+    boundaries = []
+    for index in range(1, columns):
+        ideal = page_width * index / columns
+        window = page_width * 0.08  # 이상적 위치에서 ±8% 안에서만 찾는다
+        best, best_gap = ideal, -1.0
+
+        # 후보 x를 훑으며 그 x를 가로지르는 글자가 없는 가장 넓은 띠를 찾는다
+        step = page_width / 400
+        x = ideal - window
+        run_start = None
+        while x <= ideal + window:
+            crossing = any(w["x0"] < x < w["x1"] for w in words)
+            if not crossing:
+                if run_start is None:
+                    run_start = x
+            else:
+                if run_start is not None:
+                    gap = x - run_start
+                    if gap > best_gap:
+                        best_gap, best = gap, (run_start + x) / 2
+                    run_start = None
+            x += step
+        if run_start is not None:
+            gap = (ideal + window) - run_start
+            if gap > best_gap:
+                best_gap, best = gap, (run_start + ideal + window) / 2
+
+        boundaries.append(best if best_gap > 0 else ideal)
+    return boundaries
+
+
+def _column_of(word: dict, boundaries: list[float]) -> int:
+    center = (word["x0"] + word["x1"]) / 2
+    for index, bound in enumerate(boundaries):
+        if center < bound:
+            return index
+    return len(boundaries)
+
+
+def _collect_boxes(page) -> list[tuple[float, float, float, float]]:
+    """페이지에 그려진 사각형 테두리를 모은다.
+
+    한글/평가원 PDF는 상자를 rect 하나로 그리기도 하고, 선 네 개로 그리기도
+    한다. 둘 다 받는다.
+    """
+    boxes: list[tuple[float, float, float, float]] = []
+
+    for rect in page.rects:
+        width = rect["x1"] - rect["x0"]
+        height = rect["bottom"] - rect["top"]
+        if width > page.width * 0.15 and height > 8:
+            boxes.append((rect["x0"], rect["top"], rect["x1"], rect["bottom"]))
+
+    # 선분으로 그린 상자 복원: 가로선 두 개가 x범위를 공유하면 상자로 본다
+    horizontals = [
+        l for l in page.lines if abs(l["bottom"] - l["top"]) < 2 and (l["x1"] - l["x0"]) > page.width * 0.15
+    ]
+    horizontals.sort(key=lambda l: l["top"])
+    for i, top_line in enumerate(horizontals):
+        for bottom_line in horizontals[i + 1:]:
+            if bottom_line["top"] - top_line["top"] < 10:
+                continue
+            overlap = min(top_line["x1"], bottom_line["x1"]) - max(top_line["x0"], bottom_line["x0"])
+            if overlap > (top_line["x1"] - top_line["x0"]) * 0.8:
+                candidate = (
+                    max(top_line["x0"], bottom_line["x0"]),
+                    top_line["top"],
+                    min(top_line["x1"], bottom_line["x1"]),
+                    bottom_line["bottom"],
+                )
+                if not _overlaps_existing(candidate, boxes):
+                    boxes.append(candidate)
+                break
+
+    return boxes
+
+
+def _overlaps_existing(candidate, boxes) -> bool:
+    cx0, ctop, cx1, cbottom = candidate
+    for x0, top, x1, bottom in boxes:
+        if abs(x0 - cx0) < 5 and abs(top - ctop) < 5 and abs(bottom - cbottom) < 5:
+            return True
+    return False
+
+
+def _looks_like_running_head(line: TextLine, page_height: float) -> bool:
+    """머리말/꼬리말인지 판단한다."""
+    text = line.text.strip()
+    if not text:
+        return True
+    near_top = line.top < page_height * 0.07
+    near_bottom = line.bottom > page_height * 0.93
+    if not (near_top or near_bottom):
+        return False
+    if RE_PAGE_NUMBER.match(text):
+        return True
+    if RE_RUNNING_HEAD.search(text):
+        return True
+    # 짧은데 문항 시작도 선택지도 아니면 머리말로 본다
+    if len(text) <= 20 and not RE_QUESTION_START.match(text) and text[0] not in CHOICE_MARK_SET:
+        return True
+    return False
+
+
+# 줄 앞에 오면 "새 단위가 시작된다"고 보는 표시들.
+# 이런 줄은 앞줄에 이어 붙이지 않는다.
+RE_NEW_UNIT = re.compile(
+    r"^("
+    r"\d{1,3}\s*[.．]"          # 문항 번호
+    r"|[①②③④⑤]"               # 선택지
+    r"|[ㄱ-ㅎ]\s*[.．]"          # 보기 항목
+    r"|[가-힣]\s*[:：]"          # 갑: 을: 병:
+    r"|[<〈][\s]*보"            # <보기>
+    r"|[※○□■●]"                # 안내 기호
+    r")"
+)
+
+
+# 이 표시로 끝나는 줄은 그 자체로 완결된 것으로 본다.
+# 발문은 거의 예외 없이 물음표나 "~시오."로 끝나므로, 뒤따르는 지문이
+# 발문에 딸려 들어가는 것을 막아 준다.
+# "~이다." 같은 평서형 종결은 넣지 않는다. 지문 한가운데서도 흔히 나와서
+# 넣으면 멀쩡한 문단이 매 문장마다 쪼개진다.
+RE_LINE_FINAL = re.compile(r"([?？!！]|시오\.)\s*$")
+
+
+def _looks_wrapped(buffer: TextLine, nxt: TextLine, right_edge: float) -> bool:
+    """앞줄이 자리가 없어서 넘어간 것인지 판단한다.
+
+    "오른쪽 끝에 가까운가"로만 보면 어절 단위 줄바꿈에서 생기는 들쭉날쭉한
+    여백 때문에 자꾸 놓친다. 대신 다음 줄의 첫 어절이 앞줄에 들어갈 수
+    있었는지를 따진다. 못 들어갔다면 줄바꿈이고, 들어갈 수 있었는데도
+    넘어갔다면 거기서 문단이 끝난 것이다.
+    """
+    first_word = nxt.text.split(" ")[0]
+    if not first_word:
+        return False
+    # 한글은 한 글자가 대략 한 em이다. 영문·숫자는 그 절반으로 친다.
+    width = sum(
+        buffer.size * (0.5 if ch.isascii() else 1.0) for ch in first_word
+    )
+    return buffer.x1 + width > right_edge - buffer.size * 0.3
+
+
+def _reflow(lines: list[TextLine]) -> list[TextLine]:
+    """줄바꿈으로 잘린 한 문단을 도로 이어 붙인다.
+
+    PDF의 한 '줄'은 조판 결과일 뿐 논리적 단위가 아니다. 오른쪽 끝까지 꽉
+    찬 줄은 다음 줄로 이어지는 중이라고 보고 합친다. 합치지 않는 경우는
+    세 가지다. 다음 줄이 새 단위(문항 번호·선택지·보기 항목)로 시작할 때,
+    앞줄이 물음표 등으로 이미 끝났을 때, 그리고 단·쪽·상자가 바뀔 때.
+
+    읽기 순서를 절대 바꾸지 않는다. 상자 안팎을 섞어 정렬하면 문항이
+    통째로 뒤엉킨다.
+    """
+    if not lines:
+        return []
+
+    # 그룹(단/쪽/상자)마다 본문 오른쪽 끝이 어디인지 먼저 재 둔다
+    right_edges: dict[tuple, float] = {}
+    for line in lines:
+        key = (line.page, line.column, line.box_id)
+        right_edges[key] = max(right_edges.get(key, 0.0), line.x1)
+
+    merged: list[TextLine] = []
+    buffer: TextLine | None = None
+
+    for line in lines:
+        if buffer is None:
+            buffer = line
+            continue
+
+        same_group = (
+            buffer.page == line.page
+            and buffer.column == line.column
+            and buffer.box_id == line.box_id
+        )
+        right_edge = right_edges[(buffer.page, buffer.column, buffer.box_id)]
+
+        if (
+            same_group
+            and _looks_wrapped(buffer, line, right_edge)
+            and not RE_NEW_UNIT.match(line.text)
+            and not RE_LINE_FINAL.search(buffer.text)
+        ):
+            buffer = TextLine(
+                text=f"{buffer.text} {line.text}".strip(),
+                x0=min(buffer.x0, line.x0),
+                x1=max(buffer.x1, line.x1),
+                top=buffer.top,
+                bottom=line.bottom,
+                size=buffer.size,
+                page=buffer.page,
+                column=buffer.column,
+                box_id=buffer.box_id,
+            )
+        else:
+            merged.append(buffer)
+            buffer = line
+
+    if buffer is not None:
+        merged.append(buffer)
+
+    return merged
+
+
+def load_lines(
+    pdf_path: str | Path,
+    *,
+    columns: int = 2,
+    report: ParseReport | None = None,
+) -> list[TextLine]:
+    """PDF를 읽기 순서(좌단 위->아래, 우단 위->아래)의 줄 목록으로 만든다."""
+    report = report if report is not None else ParseReport()
+    result: list[TextLine] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        report.pages = len(pdf.pages)
+        for page_number, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+            if not words:
+                continue
+
+            boundaries = _detect_column_split(words, page.width, columns)
+            boxes = _collect_boxes(page)
+            report.boxes_found += len(boxes)
+
+            # 단마다 잘라서 pdfplumber의 줄 조립기를 그대로 쓴다.
+            # 직접 단어를 잇는 것보다 한글 자간 처리가 정확하다.
+            edges = [0.0, *boundaries, page.width]
+            for column in range(len(edges) - 1):
+                strip = page.crop((edges[column], 0, edges[column + 1], page.height))
+                for raw in strip.extract_text_lines(strip=True, return_chars=True):
+                    text = raw["text"].strip()
+                    if not text:
+                        continue
+                    chars = raw.get("chars") or []
+                    size = (
+                        sum(c.get("size", 10) for c in chars) / len(chars) if chars else 10.0
+                    )
+                    line = TextLine(
+                        text=unicodedata.normalize("NFC", text),
+                        x0=raw["x0"],
+                        x1=raw["x1"],
+                        top=raw["top"],
+                        bottom=raw["bottom"],
+                        size=size,
+                        page=page_number,
+                        column=column,
+                    )
+                    if _looks_like_running_head(line, page.height):
+                        report.dropped_running_heads.append(line.text)
+                        continue
+
+                    center_y = (line.top + line.bottom) / 2
+                    for box_index, (bx0, btop, bx1, bbottom) in enumerate(boxes):
+                        if bx0 - 2 <= line.x0 and line.x1 <= bx1 + 2 and btop <= center_y <= bbottom:
+                            line.box_id = page_number * 1000 + box_index
+                            break
+                    result.append(line)
+
+    result = _reflow(result)
+    report.lines = len(result)
+    return result
+
+
+# ----------------------------------------------------------------------
+# 5단계: 줄 흐름 -> 문항
+# ----------------------------------------------------------------------
+
+
+def _split_choices(text: str) -> list[tuple[str, str]]:
+    """한 줄에 섞여 있는 선택지들을 (기호, 본문) 목록으로 자른다."""
+    parts = CHOICE_SPLIT.split(text)
+    out: list[tuple[str, str]] = []
+    index = 1
+    while index < len(parts):
+        mark = parts[index]
+        body = parts[index + 1] if index + 1 < len(parts) else ""
+        out.append((mark, body.strip()))
+        index += 2
+    return out
+
+
+def _stem_looks_complete(stem: str) -> bool:
+    stripped = stem.rstrip()
+    return stripped.endswith(("?", "？")) or stripped.endswith(("시오.", "것은.", "쓰시오."))
+
+
+class _QuestionBuilder:
+    def __init__(self, number: int, first_text: str):
+        self.number = number
+        self.stem_parts: list[str] = [first_text] if first_text else []
+        self.passage: list[str] = []
+        self.boxes: list[Box] = []
+        self.choices: list[str] = []
+        self._box_buffer: dict[int, list[str]] = {}
+        self._box_order: list[int] = []
+        self._in_choices = False
+
+    # -- 수집 --
+
+    def add_box_line(self, box_id: int, text: str) -> None:
+        if box_id not in self._box_buffer:
+            self._box_buffer[box_id] = []
+            self._box_order.append(box_id)
+        self._box_buffer[box_id].append(text)
+
+    def add_plain_line(self, text: str) -> None:
+        if self._in_choices:
+            if self.choices:
+                self.choices[-1] = f"{self.choices[-1]} {text}".strip()
+            return
+        if not _stem_looks_complete(" ".join(self.stem_parts)):
+            self.stem_parts.append(text)
+        else:
+            self.passage.append(text)
+
+    def add_choice_line(self, text: str) -> None:
+        self._in_choices = True
+        for _, body in _split_choices(text):
+            self.choices.append(body)
+
+    # -- 마무리 --
+
+    def _finish_boxes(self) -> list[Box]:
+        boxes = []
+        for box_id in self._box_order:
+            lines = [l for l in self._box_buffer[box_id] if l.strip()]
+            if not lines:
+                continue
+            kind = "제시문"
+            label = None
+            if RE_BOGI_LABEL.match(lines[0].replace(" ", "")) or RE_BOGI_LABEL.match(lines[0]):
+                kind = "보기"
+                lines = lines[1:]
+            boxes.append(Box(lines=lines, kind=kind, label=label, auto_mark=False))
+        return boxes
+
+    def build(self) -> Question:
+        stem = " ".join(part.strip() for part in self.stem_parts).strip()
+        points = None
+        match = RE_POINTS.search(stem)
+        if match:
+            points = int(match.group(1))
+            stem = RE_POINTS.sub("", stem).strip()
+        return Question(
+            number=self.number,
+            stem=stem,
+            points=points,
+            passage=self.passage,
+            boxes=self._finish_boxes(),
+            choices=self.choices,
+        )
+
+
+def parse_lines(lines: list[TextLine], report: ParseReport | None = None) -> list[Question]:
+    report = report if report is not None else ParseReport()
+    questions: list[Question] = []
+    current: _QuestionBuilder | None = None
+
+    for line in lines:
+        text = line.text.strip()
+        if not text:
+            continue
+
+        start = RE_QUESTION_START.match(text)
+        # 상자 안의 "1." 은 문항 번호가 아니라 자료의 일부다
+        if start and not line.in_box:
+            number = int(start.group(1))
+            if current is not None:
+                questions.append(current.build())
+            current = _QuestionBuilder(number, start.group(2).strip())
+            continue
+
+        if current is None:
+            continue  # 첫 문항 앞의 안내문 등은 버린다
+
+        if line.in_box:
+            current.add_box_line(line.box_id, text)
+        elif text[0] in CHOICE_MARK_SET:
+            current.add_choice_line(text)
+        else:
+            current.add_plain_line(text)
+
+    if current is not None:
+        questions.append(current.build())
+
+    for question in questions:
+        if len(question.choices) not in (0, 5):
+            report.warnings.append(
+                f"{question.number}번: 선택지를 {len(question.choices)}개만 찾음 — 확인 필요"
+            )
+        if not question.stem:
+            report.warnings.append(f"{question.number}번: 발문을 찾지 못함")
+
+    return questions
+
+
+def parse_pdf(
+    pdf_path: str | Path,
+    *,
+    columns: int = 2,
+    subject: str = "",
+    title: str = "",
+) -> tuple[Exam, ParseReport]:
+    """PDF 한 부를 Exam으로 만든다. 보고서도 함께 돌려준다."""
+    report = ParseReport()
+    lines = load_lines(pdf_path, columns=columns, report=report)
+    questions = parse_lines(lines, report)
+
+    exam = Exam(
+        subject=subject or Path(pdf_path).stem,
+        title=title or Path(pdf_path).stem,
+        total_questions=len(questions) or None,
+        questions=questions,
+    )
+    report.warnings.extend(exam.validate())
+    return exam, report
