@@ -1,0 +1,4 @@
+-r requirements.txt
+
+pytest>=8.0             # 테스트
+reportlab>=4.0          # 시험용 PDF 생성 (tests/make_fixture_pdf.py)

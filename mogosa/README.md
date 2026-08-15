@@ -14,9 +14,22 @@
 
 ## 설치
 
+파이썬 3.10 이상이 필요하다.
+
 ```bash
-pip install python-hwpx pdfplumber
+git clone https://github.com/kkbemo/manbit.git
+cd manbit
+git checkout claude/hwp-pdf-conversion-dc5wiy
+
+python -m venv .venv
+source .venv/bin/activate        # 윈도우: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
+
+테스트까지 돌려 보려면 `pip install -r requirements-dev.txt`.
+
+명령은 항상 저장소 루트(`manbit/`)에서 실행한다. `mogosa/` 안으로 들어가면
+`python -m mogosa`가 패키지를 찾지 못한다.
 
 ## 쓰는 법
 
