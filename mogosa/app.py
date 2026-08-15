@@ -104,6 +104,27 @@ def _load_standards_from_upload(storage) -> object | None:
     return StandardSet.from_text(raw)
 
 
+def _convert_as_is(storage, options: dict) -> tuple[Path, list[str]]:
+    """'원본 그대로' 모드: 쪽을 사진처럼 떠서 옮긴다."""
+    from .hwpx_writer import render_pdf_as_images
+
+    suffix = Path(storage.filename).suffix.lower()
+    if suffix != ".pdf":
+        raise ValueError("'원본 그대로' 모드는 PDF에만 쓸 수 있습니다.")
+
+    temp_pdf = WORK_DIR / f"{uuid.uuid4().hex}.pdf"
+    storage.save(temp_pdf)
+    try:
+        stem = _safe_stem(storage.filename)
+        out = WORK_DIR / f"{uuid.uuid4().hex[:12]}_{stem}_원본그대로.hwpx"
+        render_pdf_as_images(temp_pdf, out, dpi=int(options.get("dpi", 200)))
+        return out, [
+            "원본 그대로 모드입니다. 모양은 원본과 같지만 글자를 고칠 수 없습니다.",
+        ]
+    finally:
+        temp_pdf.unlink(missing_ok=True)
+
+
 def _build_exam(storage, options: dict) -> tuple[Exam, list[str]]:
     """업로드한 파일에서 Exam을 만든다. 확장자로 PDF인지 JSON인지 가린다."""
     suffix = Path(storage.filename).suffix.lower()
@@ -238,7 +259,21 @@ def create_app() -> Flask:
                 "title": request.form.get("title", "").strip(),
                 "answers": request.form.get("answers") == "on",
                 "spec_table": request.form.get("spec_table") == "on",
+                "mode": request.form.get("mode", "edit"),
             }
+
+            if options["mode"] == "as_is":
+                path, notes = _convert_as_is(upload, options)
+                job = Job(
+                    token=uuid.uuid4().hex[:12],
+                    exam=Exam(),
+                    warnings=notes,
+                    source_name=upload.filename,
+                    options=options,
+                    files={"as_is": path},
+                )
+                JOBS.put(job)
+                return jsonify(_job_payload(job))
 
             exam, warnings = _build_exam(upload, options)
             if options["subject"]:
@@ -375,6 +410,10 @@ PAGE = r"""<!doctype html>
         border-radius:6px;font-size:14px;font-family:inherit;background:#fff}
   .checks{display:flex;gap:20px;flex-wrap:wrap;margin-top:14px}
   .checks label{display:flex;align-items:center;gap:7px;font-size:14px;cursor:pointer}
+  label.mode{display:flex;gap:9px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);
+        border-radius:8px;margin-bottom:8px;cursor:pointer;font-size:13.5px;line-height:1.5}
+  label.mode:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+  label.mode input{margin-top:3px}
   button{font-family:inherit;font-size:15px;font-weight:700;padding:12px 22px;border-radius:8px;
          border:0;background:var(--accent);color:#fff;cursor:pointer}
   button:hover{background:#16407a}
@@ -446,6 +485,15 @@ PAGE = r"""<!doctype html>
         <select id="columns"><option value="2">2단 (평가원 형식)</option><option value="1">1단</option></select>
       </div>
     </div>
+    <div style="margin-top:16px">
+      <label class="field">변환 방식</label>
+      <label class="mode"><input type="radio" name="mode" value="edit" checked>
+        <span><b>편집할 수 있게</b> — 글자를 다시 짜 넣습니다. 문항을 고치거나 재구성할 수 있고,
+        그림·도표는 원본에서 오려 붙입니다.</span></label>
+      <label class="mode"><input type="radio" name="mode" value="as_is">
+        <span><b>원본 그대로</b> — 쪽을 사진처럼 떠서 옮깁니다. 모양이 원본과 100% 같지만
+        글자를 고칠 수 없습니다. 그대로 인쇄해 쓰실 때 알맞습니다.</span></label>
+    </div>
     <div class="checks">
       <label><input type="checkbox" id="answers" checked> 교사용에 정답·해설 넣기</label>
       <label><input type="checkbox" id="spec_table" checked> 교사용에 이원목적표 넣기</label>
@@ -484,6 +532,7 @@ $('go').onclick=async()=>{
   fd.append('subject',$('subject').value);
   fd.append('title',$('title').value);
   fd.append('columns',$('columns').value);
+  fd.append('mode',document.querySelector('input[name=mode]:checked').value);
   if($('answers').checked) fd.append('answers','on');
   if($('spec_table').checked) fd.append('spec_table','on');
 
@@ -517,12 +566,17 @@ function render(d){
 
   const real=d.warnings.filter(w=>!w.startsWith('읽은 결과'));
   const info=d.warnings.filter(w=>w.startsWith('읽은 결과'));
-  html+='<div class="msg ok">문항 '+d.questions+'개를 만들었습니다.'+
-        (info.length?' ('+esc(info[0])+')':'')+'</div>';
+  if(d.downloads.as_is){
+    html+='<div class="msg ok">원본 그대로 옮겼습니다.</div>';
+  } else {
+    html+='<div class="msg ok">문항 '+d.questions+'개를 만들었습니다.'+
+          (info.length?' ('+esc(info[0])+')':'')+'</div>';
+  }
   if(real.length) html+='<div class="msg warn"><b>확인이 필요합니다</b><br>'+
         real.map(esc).join('<br>')+'</div>';
 
   html+='<div class="dl">';
+  if(d.downloads.as_is) html+='<a href="'+d.downloads.as_is+'">한글 파일 받기 (원본 그대로)</a>';
   if(d.downloads.student) html+='<a href="'+d.downloads.student+'">학생용 시험지 받기</a>';
   if(d.downloads.teacher) html+='<a href="'+d.downloads.teacher+'">교사용 받기 (정답·이원목적표)</a>';
   if(d.downloads.json) html+='<a class="alt" href="'+d.downloads.json+'">문항 JSON 받기</a>';

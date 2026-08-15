@@ -107,7 +107,7 @@ def test_convert_pdf(client, fixture_pdf: Path):
     }, content_type="multipart/form-data")
 
     data = response.get_json()
-    assert data["questions"] == 6
+    assert data["questions"] == 7
     assert any(w.startswith("읽은 결과") for w in data["warnings"])
 
 
@@ -262,3 +262,54 @@ def test_standards_from_pasted_text_file(client):
 
     assert data["standard_count"] == 2
     assert data["rows"][0]["standard"] == "12생윤04-02"
+
+
+# ---------- 원본 그대로 모드 ----------
+
+
+def test_as_is_mode(client, fixture_pdf: Path):
+    """쪽을 사진처럼 떠서 옮기는 모드."""
+    import zipfile
+
+    response = client.post("/convert", data={
+        "file": upload(fixture_pdf),
+        "mode": "as_is",
+    }, content_type="multipart/form-data")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "as_is" in data["downloads"]
+    assert any("원본 그대로" in w for w in data["warnings"])
+
+    body = client.get(data["downloads"]["as_is"]).data
+    names = zipfile.ZipFile(io.BytesIO(body)).namelist()
+    assert any(n.startswith("BinData/") for n in names), "쪽 그림이 들어 있어야 한다"
+
+
+def test_as_is_mode_rejects_json(client):
+    response = client.post("/convert", data={
+        "file": upload(SAMPLE),
+        "mode": "as_is",
+    }, content_type="multipart/form-data")
+    assert response.status_code == 500
+    assert "PDF" in response.get_json()["error"]
+
+
+def test_edit_mode_keeps_figures(client, fixture_pdf: Path):
+    """편집 모드에서도 그림은 살아 있어야 한다."""
+    import zipfile
+
+    data = client.post("/convert", data={
+        "file": upload(fixture_pdf),
+        "mode": "edit",
+    }, content_type="multipart/form-data").get_json()
+
+    body = client.get(data["downloads"]["student"]).data
+    names = zipfile.ZipFile(io.BytesIO(body)).namelist()
+    assert any(n.startswith("BinData/") for n in names), "그래프가 빠졌다"
+
+
+def test_mode_selector_on_page(client):
+    body = client.get("/").get_data(as_text=True)
+    assert 'value="as_is"' in body
+    assert "원본 그대로" in body

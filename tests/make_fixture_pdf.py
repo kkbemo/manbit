@@ -113,6 +113,38 @@ class Sheet:
             y -= size + 4
         self.y = top - height - 8
 
+    def graph(self, height: float = 90) -> None:
+        """꺾은선 그래프를 벡터로 그린다.
+
+        평가원 사회탐구의 도표 문항을 흉내 낸 것이다. 이런 그림이 변환에서
+        통째로 사라지지 않는지 확인하는 것이 목적이다.
+        """
+        self._advance(height + 10)
+        c = self.canvas
+        x0 = self.col_x() + 10
+        y0 = self.y - height + 10
+        width = COL_W - 30
+
+        c.setLineWidth(1)
+        c.line(x0, y0, x0 + width, y0)          # 가로축
+        c.line(x0, y0, x0, y0 + height - 20)    # 세로축
+
+        points = [0.15, 0.55, 0.35, 0.8, 0.65]
+        c.setLineWidth(1.4)
+        previous = None
+        for i, value in enumerate(points):
+            px = x0 + width * (i / (len(points) - 1))
+            py = y0 + (height - 30) * value
+            if previous:
+                c.line(previous[0], previous[1], px, py)
+            c.circle(px, py, 2, stroke=1, fill=1)
+            previous = (px, py)
+
+        c.setFont(FONT, 7)
+        c.drawString(x0 + width - 20, y0 - 10, "(연도)")
+        c.drawString(x0 - 8, y0 + height - 18, "(%)")
+        self.y = y0 - 26
+
     def gap(self, amount: float = 8) -> None:
         self.y -= amount
 
@@ -175,8 +207,21 @@ def build(path: Path) -> Path:
         sheet.text_block(f"{mark} {body}", size=10, hanging=11)
     sheet.gap(10)
 
+    # 3-1번: 그림(그래프)이 들어간 문항 — 그림이 살아 넘어가는지 확인용
+    sheet.text_block("4. 다음 그래프에 대한 설명으로 옳은 것은?", size=10, hanging=12)
+    sheet.graph()
+    for mark, body in [
+        ("①", "그래프의 가로축은 연도를 나타낸다."),
+        ("②", "값은 꾸준히 증가하였다."),
+        ("③", "중간에 감소한 구간이 있다."),
+        ("④", "최댓값은 마지막 해에 나타났다."),
+        ("⑤", "변화율이 가장 큰 구간은 처음이다."),
+    ]:
+        sheet.text_block(f"{mark} {body}", size=10, hanging=11)
+    sheet.gap(10)
+
     # 4~6번: 단/쪽을 넘기게 만드는 채움 문항
-    for number in range(4, 7):
+    for number in range(5, 8):
         sheet.text_block(f"{number}. 다음 설명으로 옳은 것을 고른 것은?", size=10, hanging=12)
         sheet.box([
             f"이것은 {number}번 문항의 제시문이다. 단 넘김과 쪽 넘김이 일어나도 "

@@ -22,7 +22,15 @@ from pathlib import Path
 
 import pdfplumber
 
-from .model import CHOICE_MARKS, Box, Exam, Question
+from .model import CHOICE_MARKS, Box, Exam, Figure, Question
+
+PT_PER_MM = 72 / 25.4
+
+
+def _encode(data: bytes) -> str:
+    from .figures import encode
+
+    return encode(data)
 
 # 문항 시작: "1." "12." "1 ." 등
 RE_QUESTION_START = re.compile(r"^(\d{1,3})\s*[.．]\s*(.*)$")
@@ -43,7 +51,11 @@ CHOICE_SPLIT = re.compile(f"([{''.join(CHOICE_MARKS)}])")
 
 @dataclass
 class TextLine:
-    """PDF에서 뽑아낸 한 줄."""
+    """PDF에서 뽑아낸 한 줄.
+
+    figure_index가 있으면 글자가 아니라 '여기에 그림이 있었다'는 표시다.
+    읽기 순서 그대로 끼워 두었다가, 문항을 자를 때 그 문항에 그림을 붙인다.
+    """
 
     text: str
     x0: float
@@ -54,10 +66,15 @@ class TextLine:
     page: int
     column: int
     box_id: int | None = None
+    figure_index: int | None = None
 
     @property
     def in_box(self) -> bool:
         return self.box_id is not None
+
+    @property
+    def is_figure(self) -> bool:
+        return self.figure_index is not None
 
 
 @dataclass
@@ -68,12 +85,16 @@ class ParseReport:
     lines: int = 0
     dropped_running_heads: list[str] = field(default_factory=list)
     boxes_found: int = 0
+    figures_found: int = 0
+    text_absorbed_by_figures: int = 0
     warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         parts = [
             f"{self.pages}쪽 / {self.lines}줄 / 상자 {self.boxes_found}개",
         ]
+        if self.figures_found:
+            parts.append(f"그림·도표 {self.figures_found}개 살림")
         if self.dropped_running_heads:
             parts.append(f"머리말·꼬리말 {len(self.dropped_running_heads)}줄 제거")
         return " · ".join(parts)
@@ -265,6 +286,12 @@ def _reflow(lines: list[TextLine]) -> list[TextLine]:
             buffer = line
             continue
 
+        # 그림 표시줄은 글자가 아니므로 어느 쪽으로도 이어 붙이지 않는다
+        if line.is_figure or buffer.is_figure:
+            merged.append(buffer)
+            buffer = line
+            continue
+
         same_group = (
             buffer.page == line.page
             and buffer.column == line.column
@@ -304,15 +331,26 @@ def load_lines(
     *,
     columns: int = 2,
     report: ParseReport | None = None,
+    keep_figures: bool = True,
+    figure_store: dict[int, "Figure"] | None = None,
 ) -> list[TextLine]:
-    """PDF를 읽기 순서(좌단 위->아래, 우단 위->아래)의 줄 목록으로 만든다."""
+    """PDF를 읽기 순서(좌단 위->아래, 우단 위->아래)의 줄 목록으로 만든다.
+
+    keep_figures가 켜져 있으면 그림·도표도 찾아서 원본 그대로 떠 온다.
+    그림 자리에는 표시용 줄을 하나 끼워 두어 읽기 순서가 유지되게 한다.
+    """
+    from .figures import FigureRegion, detect_figures, render_regions
+    from .model import Figure
+
     report = report if report is not None else ParseReport()
     result: list[TextLine] = []
+    figure_counter = 0
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         report.pages = len(pdf.pages)
         for page_number, page in enumerate(pdf.pages, start=1):
-            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=False,
+                                       extra_attrs=["size"])
             if not words:
                 continue
 
@@ -320,11 +358,22 @@ def load_lines(
             boxes = _collect_boxes(page)
             report.boxes_found += len(boxes)
 
+            regions: list[FigureRegion] = (
+                detect_figures(page, page_number, boxes, words) if keep_figures else []
+            )
+            rendered: list[bytes] = []
+            if regions:
+                rendered = render_regions(pdf_path, page_number, regions)
+                report.figures_found += len(regions)
+
             # 단마다 잘라서 pdfplumber의 줄 조립기를 그대로 쓴다.
             # 직접 단어를 잇는 것보다 한글 자간 처리가 정확하다.
             edges = [0.0, *boundaries, page.width]
             for column in range(len(edges) - 1):
-                strip = page.crop((edges[column], 0, edges[column + 1], page.height))
+                left_edge, right_edge = edges[column], edges[column + 1]
+                entries: list[tuple[float, TextLine]] = []
+
+                strip = page.crop((left_edge, 0, right_edge, page.height))
                 for raw in strip.extract_text_lines(strip=True, return_chars=True):
                     text = raw["text"].strip()
                     if not text:
@@ -347,12 +396,41 @@ def load_lines(
                         report.dropped_running_heads.append(line.text)
                         continue
 
+                    # 그림 안에 들어 있는 글자(축 이름, 눈금 따위)는 본문으로 새면 안 된다.
+                    # 그 글자들은 이미 그림에 함께 찍혀 있다.
+                    if any(r.contains(line.x0, line.top, line.x1, line.bottom) for r in regions):
+                        report.text_absorbed_by_figures += 1
+                        continue
+
                     center_y = (line.top + line.bottom) / 2
                     for box_index, (bx0, btop, bx1, bbottom) in enumerate(boxes):
                         if bx0 - 2 <= line.x0 and line.x1 <= bx1 + 2 and btop <= center_y <= bbottom:
                             line.box_id = page_number * 1000 + box_index
                             break
-                    result.append(line)
+                    entries.append((line.top, line))
+
+                # 이 단에 걸린 그림들을 표시용 줄로 끼워 넣는다
+                for region, data in zip(regions, rendered):
+                    center_x = (region.x0 + region.x1) / 2
+                    if not (left_edge <= center_x < right_edge) or not data:
+                        continue
+                    figure_counter += 1
+                    if figure_store is not None:
+                        figure_store[figure_counter] = Figure(
+                            image_base64=_encode(data),
+                            width_mm=round(region.width_pt / PT_PER_MM, 1),
+                            height_mm=round(region.height_pt / PT_PER_MM, 1),
+                            source_page=page_number,
+                        )
+                    entries.append((region.top, TextLine(
+                        text="", x0=region.x0, x1=region.x1,
+                        top=region.top, bottom=region.bottom,
+                        size=10.0, page=page_number, column=column,
+                        figure_index=figure_counter,
+                    )))
+
+                entries.sort(key=lambda item: item[0])
+                result.extend(line for _, line in entries)
 
     result = _reflow(result)
     report.lines = len(result)
@@ -388,10 +466,14 @@ class _QuestionBuilder:
         self.stem_parts: list[str] = [first_text] if first_text else []
         self.passage: list[str] = []
         self.boxes: list[Box] = []
+        self.figure_indexes: list[int] = []
         self.choices: list[str] = []
         self._box_buffer: dict[int, list[str]] = {}
         self._box_order: list[int] = []
         self._in_choices = False
+
+    def add_figure(self, index: int) -> None:
+        self.figure_indexes.append(index)
 
     # -- 수집 --
 
@@ -432,29 +514,47 @@ class _QuestionBuilder:
             boxes.append(Box(lines=lines, kind=kind, label=label, auto_mark=False))
         return boxes
 
-    def build(self) -> Question:
+    def build(self, figure_store: dict[int, Figure] | None = None) -> Question:
         stem = " ".join(part.strip() for part in self.stem_parts).strip()
         points = None
         match = RE_POINTS.search(stem)
         if match:
             points = int(match.group(1))
             stem = RE_POINTS.sub("", stem).strip()
+
+        figures = []
+        if figure_store:
+            for index in self.figure_indexes:
+                figure = figure_store.get(index)
+                if figure is not None:
+                    figures.append(figure)
+
         return Question(
             number=self.number,
             stem=stem,
             points=points,
             passage=self.passage,
             boxes=self._finish_boxes(),
+            figures=figures,
             choices=self.choices,
         )
 
 
-def parse_lines(lines: list[TextLine], report: ParseReport | None = None) -> list[Question]:
+def parse_lines(
+    lines: list[TextLine],
+    report: ParseReport | None = None,
+    figure_store: dict[int, Figure] | None = None,
+) -> list[Question]:
     report = report if report is not None else ParseReport()
     questions: list[Question] = []
     current: _QuestionBuilder | None = None
 
     for line in lines:
+        if line.is_figure:
+            if current is not None:
+                current.add_figure(line.figure_index)
+            continue
+
         text = line.text.strip()
         if not text:
             continue
@@ -464,7 +564,7 @@ def parse_lines(lines: list[TextLine], report: ParseReport | None = None) -> lis
         if start and not line.in_box:
             number = int(start.group(1))
             if current is not None:
-                questions.append(current.build())
+                questions.append(current.build(figure_store))
             current = _QuestionBuilder(number, start.group(2).strip())
             continue
 
@@ -479,7 +579,7 @@ def parse_lines(lines: list[TextLine], report: ParseReport | None = None) -> lis
             current.add_plain_line(text)
 
     if current is not None:
-        questions.append(current.build())
+        questions.append(current.build(figure_store))
 
     for question in questions:
         if len(question.choices) not in (0, 5):
@@ -498,11 +598,16 @@ def parse_pdf(
     columns: int = 2,
     subject: str = "",
     title: str = "",
+    keep_figures: bool = True,
 ) -> tuple[Exam, ParseReport]:
     """PDF 한 부를 Exam으로 만든다. 보고서도 함께 돌려준다."""
     report = ParseReport()
-    lines = load_lines(pdf_path, columns=columns, report=report)
-    questions = parse_lines(lines, report)
+    figure_store: dict[int, Figure] = {}
+    lines = load_lines(
+        pdf_path, columns=columns, report=report,
+        keep_figures=keep_figures, figure_store=figure_store,
+    )
+    questions = parse_lines(lines, report, figure_store)
 
     exam = Exam(
         subject=subject or Path(pdf_path).stem,

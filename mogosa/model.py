@@ -55,6 +55,28 @@ class Box:
 
 
 @dataclass
+class Figure:
+    """문항에 들어가는 그림·도표.
+
+    PDF에서 그 자리를 그대로 떠 온 그림이다. 다시 그린 것이 아니라 원본을
+    사진처럼 옮긴 것이라 모양이 100% 같다.
+
+    JSON으로 오갈 수 있도록 그림 자료를 base64 글자열로 들고 있는다.
+    """
+
+    image_base64: str = ""
+    width_mm: float = 70.0
+    height_mm: float = 50.0
+    source_page: int | None = None
+
+    @property
+    def data(self) -> bytes:
+        from .figures import decode
+
+        return decode(self.image_base64)
+
+
+@dataclass
 class Question:
     """문항 하나."""
 
@@ -63,6 +85,7 @@ class Question:
     points: int | None = None          # 배점. 2점 문항은 표기하지 않는 것이 관례라 보통 3 또는 None
     passage: list[str] = field(default_factory=list)   # 발문 앞에 오는 지문 (상자 없음)
     boxes: list[Box] = field(default_factory=list)     # 발문 뒤에 오는 상자들
+    figures: list[Figure] = field(default_factory=list)  # 그림·도표 (상자 뒤, 선택지 앞)
     choices: list[str] = field(default_factory=list)   # ①~⑤ 선택지 본문 (기호 제외)
 
     # 아래는 시험지에는 찍히지 않고 해설지·이원목적표에만 쓰인다
@@ -130,6 +153,15 @@ class Exam:
                 )
                 for b in raw.get("boxes", [])
             ]
+            figures = [
+                Figure(
+                    image_base64=f.get("image_base64", ""),
+                    width_mm=float(f.get("width_mm", 70.0)),
+                    height_mm=float(f.get("height_mm", 50.0)),
+                    source_page=f.get("source_page"),
+                )
+                for f in raw.get("figures", [])
+            ]
             questions.append(
                 Question(
                     number=int(raw["number"]),
@@ -137,6 +169,7 @@ class Exam:
                     points=raw.get("points"),
                     passage=list(raw.get("passage", [])),
                     boxes=boxes,
+                    figures=figures,
                     choices=list(raw.get("choices", [])),
                     answer=raw.get("answer"),
                     explanation=raw.get("explanation", ""),

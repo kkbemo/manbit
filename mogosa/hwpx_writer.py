@@ -261,10 +261,37 @@ class ExamRenderer:
         for box in q.boxes:
             self._render_box(box)
 
+        # --- 그림·도표 ---
+        for figure in q.figures:
+            self._render_figure(figure)
+
         # --- 선택지 ---
         self._render_choices(q.choices)
 
         return stem_para
+
+    def _render_figure(self, figure) -> None:
+        """PDF에서 떠 온 그림을 넣는다. 단 폭을 넘지 않게 줄인다."""
+        s = self.style
+        data = figure.data
+        if not data:
+            return
+
+        max_width = s.column_width_mm() - 4.0
+        width = figure.width_mm or max_width
+        height = figure.height_mm or max_width * 0.7
+        if width > max_width:
+            height = height * (max_width / width)
+            width = max_width
+
+        self.doc.add_picture(
+            data, "png",
+            width_mm=round(width, 1),
+            height_mm=round(height, 1),
+            align="CENTER",
+            para_pr_id_ref=self._para_fmt(alignment="CENTER", before_pt=s.block_gap_pt,
+                                          after_pt=s.block_gap_pt),
+        )
 
     def _render_box(self, box: Box) -> None:
         s = self.style
@@ -486,6 +513,59 @@ class ExamRenderer:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.doc.save_to_path(path)
         return path
+
+
+def render_pdf_as_images(
+    pdf_path: str | Path,
+    out_path: str | Path,
+    *,
+    dpi: int = 200,
+    margin_mm: float = 6.0,
+) -> Path:
+    """PDF를 쪽 그림 그대로 한글 파일에 옮긴다 — '원본 그대로' 모드.
+
+    글자를 읽어 다시 짜는 것이 아니라 각 쪽을 사진처럼 떠서 붙인다.
+    그래서 원본과 모양이 100% 같다. 대신 글자를 고칠 수 없다.
+
+    시험지를 그대로 인쇄해 쓰려는 경우에 맞고, 문항을 손보려는 경우에는
+    맞지 않는다.
+    """
+    from .figures import page_count, render_page
+
+    pdf_path = Path(pdf_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = HwpxDocument.new()
+    doc.page.setup(
+        paper_size="A4",
+        orientation="PORTRAIT",
+        margins_mm={"left": margin_mm, "right": margin_mm,
+                    "top": margin_mm, "bottom": margin_mm,
+                    "header": 0.0, "footer": 0.0},
+    )
+
+    header = doc._root.headers[0]
+    plain = header.ensure_paragraph_format(alignment="CENTER")
+    with_break = header.ensure_paragraph_format(alignment="CENTER",
+                                                break_setting={"page_break_before": True})
+
+    width_mm = 210.0 - 2 * margin_mm
+    height_mm = 297.0 - 2 * margin_mm
+
+    total = page_count(pdf_path)
+    for number in range(1, total + 1):
+        data = render_page(pdf_path, number, dpi=dpi)
+        doc.add_picture(
+            data, "png",
+            width_mm=round(width_mm, 1),
+            height_mm=round(height_mm, 1),
+            align="CENTER",
+            para_pr_id_ref=(plain if number == 1 else with_break),
+        )
+
+    doc.save_to_path(out_path)
+    return out_path
 
 
 def render_exam(exam: Exam, path: str | Path, *, style: Style | None = None,
