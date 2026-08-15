@@ -23,7 +23,7 @@ from make_fixture_pdf import build as build_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "mogosa" / "examples" / "sample_exam.json"
-STANDARDS = ROOT / "mogosa" / "data" / "성취기준_예시.json"
+STANDARDS = ROOT / "mogosa" / "data" / "standards_example.json"
 
 
 @pytest.fixture()

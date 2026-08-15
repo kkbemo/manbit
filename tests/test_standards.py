@@ -22,7 +22,7 @@ from mogosa.standards import (
     extract_keywords,
 )
 
-DATA = Path(__file__).resolve().parents[1] / "mogosa" / "data" / "성취기준_예시.json"
+DATA = Path(__file__).resolve().parents[1] / "mogosa" / "data" / "standards_example.json"
 SAMPLE = Path(__file__).resolve().parents[1] / "mogosa" / "examples" / "sample_exam.json"
 
 

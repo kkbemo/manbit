@@ -151,7 +151,7 @@ python -m mogosa json2hwpx 출제.json -o 시험지_정답.hwpx --answers  # 교
 붙여넣은 것을 `.txt`로 저장하면 그대로 읽힌다. JSON으로 바꾸면 `keywords`를
 보탤 수 있다 — 원문에 안 나오지만 그 성취기준으로 분류되어야 할 사상가·개념어
 (예: 환경 성취기준에 `슈바이처`, `레오폴드`, `대지 윤리`)를 넣으면 정확도가
-크게 오른다. 형식은 `mogosa/data/성취기준_예시.json` 참고.
+크게 오른다. 형식은 `mogosa/data/standards_example.json` 참고.
 
 ### 1차: 도구가 기계적으로 판정한다
 
