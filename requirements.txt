@@ -1,3 +1,4 @@
 # 파이썬 3.10 이상
 python-hwpx>=6.0        # HWPX 읽기/쓰기
 pdfplumber>=0.11        # PDF 글자·좌표·선분 추출
+flask>=3.0              # 프로그램 화면(로컬 웹앱)

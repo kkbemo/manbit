@@ -45,6 +45,10 @@ STOPWORDS = {
     "성찰", "성찰하고", "실천", "실천할", "자세", "태도", "관점", "입장",
     "문제", "의미", "내용", "경우", "때문", "위해", "위한", "그것", "이것",
     "무엇", "어떤", "가장", "적절한", "옳은", "것은", "것만", "고른",
+    # 도덕과에서는 아래 말들이 사실상 기능어다. 모든 성취기준과 거의 모든
+    # 문항에 나오므로 어느 성취기준인지 가리는 데 아무 도움이 안 되는데,
+    # 성취기준을 몇 개만 넣으면 이 말들이 매칭을 끌고 가 버린다.
+    "도덕", "도덕적", "윤리", "윤리적", "판단", "고려",
 }
 
 MIN_KEYWORD_LEN = 2
@@ -195,12 +199,38 @@ class StandardSet:
             parts.append((tag, 3.0))
         return parts
 
-    def match(self, question: Question, *, top_n: int = 3) -> MatchResult:
+    def question_idf(self, questions: Iterable[Question]) -> dict[str, float]:
+        """시험지 안에서 낱말이 얼마나 흔한지 잰다.
+
+        성취기준 쪽 idf만으로는 모자란다. 윤리 시험지에서 "도덕적", "판단",
+        "고려" 같은 말은 거의 모든 문항에 나오므로 어느 성취기준인지 가리는
+        데 도움이 안 되는데, 성취기준이 몇 개 없으면 이런 말이 매칭을
+        끌고 가 버린다. 시험지 전체를 보고 흔한 말의 힘을 빼 둔다.
+        """
+        questions = list(questions)
+        total = len(questions) or 1
+        appearances: dict[str, int] = {}
+        for question in questions:
+            seen: set[str] = set()
+            for text, _ in self._question_text(question):
+                seen.update(extract_keywords(text))
+            for keyword in seen:
+                appearances[keyword] = appearances.get(keyword, 0) + 1
+        return {k: math.log(1 + total / c) for k, c in appearances.items()}
+
+    def match(
+        self,
+        question: Question,
+        *,
+        top_n: int = 3,
+        question_idf: dict[str, float] | None = None,
+    ) -> MatchResult:
         """문항 하나에 대해 성취기준 후보를 점수순으로 돌려준다."""
         weighted: dict[str, float] = {}
         for text, weight in self._question_text(question):
             for keyword in extract_keywords(text):
-                weighted[keyword] = weighted.get(keyword, 0.0) + weight
+                rarity = question_idf.get(keyword, 1.0) if question_idf else 1.0
+                weighted[keyword] = weighted.get(keyword, 0.0) + weight * rarity
 
         candidates: list[Match] = []
         for standard in self.standards:
@@ -234,9 +264,10 @@ class StandardSet:
         확신이 서지 않으면 비워 둔다. 틀린 코드를 달아 두면 사람이 검토를
         건너뛰게 되어 잘못된 채로 문서에 실린다. 빈 칸은 눈에 띈다.
         """
+        idf = self.question_idf(exam.questions)
         results: list[MatchResult] = []
         for question in exam.questions:
-            result = self.match(question)
+            result = self.match(question, question_idf=idf)
             results.append(result)
 
             if question.standard and not overwrite:
