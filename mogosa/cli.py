@@ -33,11 +33,58 @@ def _report_problems(label: str, problems: list[str]) -> None:
         print(f"  - {problem}", file=sys.stderr)
 
 
+def _load_standards(path: str | None):
+    if not path:
+        return None
+    from .standards import StandardSet
+
+    standards = StandardSet.load(path)
+    if not len(standards):
+        print(f"경고: {path} 에서 성취기준을 하나도 읽지 못했습니다.", file=sys.stderr)
+        return None
+    return standards
+
+
+def _apply_standards(exam, standards, *, verbose: bool = True) -> None:
+    """성취기준을 붙이고 검토가 필요한 문항을 알린다."""
+    if standards is None:
+        return
+    results = standards.tag_exam(exam)
+    mapped = sum(1 for q in exam.questions if q.standard)
+    print(f"성취기준 판정: {mapped}/{len(exam.questions)}문항 (기준 {len(standards)}개)")
+
+    if not verbose:
+        return
+
+    unmapped = exam.unmapped_questions()
+    low = exam.low_confidence_questions()
+    if not unmapped and not low:
+        return
+
+    print("\n[성취기준] 사람이 확인해야 할 문항", file=sys.stderr)
+    by_number = {r.number: r for r in results}
+    for number in sorted(set(unmapped) | set(low)):
+        result = by_number.get(number)
+        state = "미판정" if number in unmapped else "확신 약함"
+        print(f"  - {number}번 ({state})", file=sys.stderr)
+        if result:
+            for candidate in result.candidates[:3]:
+                standard = standards.get(candidate.code)
+                summary = standard.short(30) if standard else ""
+                hits = ", ".join(candidate.matched[:5])
+                print(
+                    f"      후보 {candidate.code} (점수 {candidate.score:.2f}) {summary}"
+                    + (f"  ← {hits}" if hits else ""),
+                    file=sys.stderr,
+                )
+
+
 def cmd_pdf2json(args) -> int:
     from .pdf_reader import parse_pdf
 
     exam, report = parse_pdf(args.input, columns=args.columns,
                              subject=args.subject, title=args.title)
+    _apply_standards(exam, _load_standards(args.standards))
     out = Path(args.output or Path(args.input).with_suffix(".json"))
     exam.to_json(out)
     print(f"{report.summary()} -> 문항 {len(exam.questions)}개")
@@ -51,8 +98,14 @@ def cmd_pdf2hwpx(args) -> int:
 
     exam, report = parse_pdf(args.input, columns=args.columns,
                              subject=args.subject, title=args.title)
+    standards = _load_standards(args.standards)
+    _apply_standards(exam, standards)
+
     out = Path(args.output or Path(args.input).with_suffix(".hwpx"))
-    render_exam(exam, out, style=_style_from_args(args), include_answers=args.answers)
+    render_exam(exam, out, style=_style_from_args(args),
+                include_answers=args.answers,
+                include_spec_table=args.spec_table,
+                standards=standards)
 
     print(f"{report.summary()} -> 문항 {len(exam.questions)}개")
     print(f"저장: {out}")
@@ -67,11 +120,54 @@ def cmd_pdf2hwpx(args) -> int:
 
 def cmd_json2hwpx(args) -> int:
     exam = Exam.from_json(args.input)
+    standards = _load_standards(args.standards)
+    _apply_standards(exam, standards)
+
     problems = exam.validate()
     out = Path(args.output or Path(args.input).with_suffix(".hwpx"))
-    render_exam(exam, out, style=_style_from_args(args), include_answers=args.answers)
+    render_exam(exam, out, style=_style_from_args(args),
+                include_answers=args.answers,
+                include_spec_table=args.spec_table,
+                standards=standards)
     print(f"문항 {len(exam.questions)}개 -> {out}")
     _report_problems("검증", problems)
+    return 0
+
+
+def cmd_analyze(args) -> int:
+    """문항에 성취기준만 붙이고 결과를 보고한다. 조판은 하지 않는다."""
+    exam = Exam.from_json(args.input)
+    standards = _load_standards(args.standards)
+    if standards is None:
+        print("성취기준 파일이 필요합니다: --standards <파일>", file=sys.stderr)
+        return 2
+
+    results = standards.tag_exam(exam, overwrite=args.overwrite)
+    out = Path(args.output or args.input)
+    exam.to_json(out)
+
+    print(f"\n{'문항':>4}  {'성취기준':<14} {'확신':>5}  근거")
+    print("-" * 68)
+    by_number = {r.number: r for r in results}
+    for question in exam.questions:
+        result = by_number.get(question.number)
+        hits = ", ".join(result.best.matched[:4]) if result and result.best else ""
+        code = question.standard or "(미판정)"
+        confidence = f"{(question.standard_confidence or 0):.2f}"
+        print(f"{question.number:>4}  {code:<14} {confidence:>5}  {hits}")
+
+    from .standards import coverage
+
+    print("\n성취기준별 출제 분포")
+    for code, numbers in coverage(exam, standards).items():
+        marker = "  " if numbers else "! "
+        listing = ", ".join(f"{n}번" for n in numbers) if numbers else "출제 없음"
+        print(f"{marker}{code:<14} {listing}")
+
+    print(f"\n저장: {out}")
+    unmapped = exam.unmapped_questions()
+    if unmapped:
+        print(f"미판정 {len(unmapped)}문항: {', '.join(str(n) for n in unmapped)}", file=sys.stderr)
     return 0
 
 
@@ -86,8 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("input", help="입력 파일")
         p.add_argument("-o", "--output", help="출력 파일 (생략하면 입력과 같은 이름)")
         p.add_argument("--columns", type=int, default=2, help="단 수 (기본 2)")
+        p.add_argument(
+            "--standards",
+            help="성취기준 파일 (.json 또는 한 줄에 하나씩 붙여넣은 .txt)",
+        )
         if with_render:
             p.add_argument("--answers", action="store_true", help="정답·해설을 뒤에 붙인다")
+            p.add_argument("--spec-table", action="store_true",
+                           help="이원목적표(문항 정보표)를 뒤에 붙인다")
             p.add_argument("--font", help="본문 글꼴 (기본 함초롬바탕)")
             p.add_argument("--size", type=float, help="본문 크기 pt (기본 10)")
 
@@ -107,6 +209,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_json_hwpx = sub.add_parser("json2hwpx", help="문항 JSON을 시험지 한글 파일로 조판")
     add_common(p_json_hwpx)
     p_json_hwpx.set_defaults(func=cmd_json2hwpx)
+
+    p_analyze = sub.add_parser(
+        "analyze", help="문항에 성취기준을 붙이고 출제 분포를 보고 (조판 없음)"
+    )
+    p_analyze.add_argument("input", help="문항 JSON")
+    p_analyze.add_argument("-o", "--output", help="저장 경로 (생략하면 입력 파일에 덮어씀)")
+    p_analyze.add_argument("--standards", required=True, help="성취기준 파일")
+    p_analyze.add_argument("--overwrite", action="store_true",
+                           help="이미 붙어 있는 성취기준도 다시 판정한다")
+    p_analyze.set_defaults(func=cmd_analyze)
 
     return parser
 

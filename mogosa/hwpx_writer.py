@@ -77,10 +77,15 @@ class Style:
 class ExamRenderer:
     """Exam 하나를 HWPX 파일 하나로 그린다."""
 
-    def __init__(self, exam: Exam, style: Style | None = None, *, include_answers: bool = False):
+    def __init__(self, exam: Exam, style: Style | None = None, *,
+                 include_answers: bool = False, include_spec_table: bool = False,
+                 standards=None):
         self.exam = exam
         self.style = style or Style()
         self.include_answers = include_answers
+        self.include_spec_table = include_spec_table
+        # 이원목적표의 "내용 요약" 칸을 채우는 데 쓴다. 없어도 동작한다.
+        self._standard_lookup = {s.code: s for s in standards} if standards else {}
 
         self.doc = HwpxDocument.new()
         self._header = self.doc._root.headers[0]
@@ -363,18 +368,90 @@ class ExamRenderer:
         for q in answered:
             if not q.explanation:
                 continue
+            runs = [
+                (f"{q.number}. ", self._char(size=s.passage_size, bold=True)),
+                (f"정답 {CHOICE_MARKS[q.answer - 1]}  ", self._char(size=s.passage_size, bold=True)),
+            ]
+            if q.standard:
+                runs.append((f"[{q.standard}]  ", self._char(size=s.passage_size - 0.5, bold=True)))
+            runs.append((q.explanation, self._char(size=s.passage_size)))
             self._write(
-                [
-                    (f"{q.number}. ", self._char(size=s.passage_size, bold=True)),
-                    (f"정답 {CHOICE_MARKS[q.answer - 1]}  ", self._char(size=s.passage_size, bold=True)),
-                    (q.explanation, self._char(size=s.passage_size)),
-                ],
+                runs,
                 para_id=self._para_fmt(
                     line_spacing=s.line_spacing,
                     left_mm=s.stem_indent_mm,
                     first_mm=-s.stem_indent_mm,
                     before_pt=s.block_gap_pt,
                 ),
+            )
+
+    def _render_spec_table(self) -> None:
+        """이원목적표 — 문항별 성취기준·배점·정답 분석표.
+
+        평가계획에 그대로 붙일 수 있게 만든다. 성취기준을 판정하지 못한
+        문항은 빈칸으로 남겨서, 사람이 채워야 할 자리가 눈에 띄게 한다.
+        """
+        s = self.style
+        questions = self.exam.questions
+        if not questions:
+            return
+
+        self._write(
+            [("문항 정보표 (이원목적표)", self._char(size=13.0, bold=True, font=s.head_font))],
+            para_id=self._para_fmt(alignment="CENTER", before_pt=18.0, after_pt=6.0),
+        )
+
+        headers = ["문항", "성취기준", "내용 요약", "배점", "정답", "난이도"]
+        fill = self.doc.styles.ensure_border_fill(
+            border_color="#000000", border_width="0.12 mm",
+            active_borders=("left", "right", "top", "bottom"),
+        )
+        table = self.doc.add_table(
+            len(questions) + 1, len(headers),
+            width=mm(s.column_width_mm()),
+            border_fill_id_ref=fill,
+        )
+
+        # 폭 배분: 내용 요약이 가장 넓어야 읽을 만하다
+        ratios = [0.08, 0.20, 0.44, 0.09, 0.09, 0.10]
+        table.set_column_widths([mm(s.column_width_mm() * r) for r in ratios])
+
+        centered = self._para_fmt(alignment="CENTER", line_spacing=130)
+        left = self._para_fmt(alignment="LEFT", line_spacing=130)
+        head_char = self._char(size=8.5, bold=True, font=s.head_font)
+        body_char = self._char(size=8.5)
+
+        for column, label in enumerate(headers):
+            self._write([(label, head_char)], para_id=centered,
+                        paragraph=table.cell(0, column).paragraphs[0])
+
+        for row, question in enumerate(questions, start=1):
+            summary = ""
+            if question.standard and self._standard_lookup:
+                standard = self._standard_lookup.get(question.standard)
+                if standard is not None:
+                    summary = standard.short(34)
+            if not summary:
+                summary = ", ".join(question.tags)
+
+            cells = [
+                (str(question.number), centered, body_char),
+                (question.standard or "", centered, body_char),
+                (summary, left, body_char),
+                (f"{question.points or 2}", centered, body_char),
+                (CHOICE_MARKS[question.answer - 1] if question.answer else "", centered, body_char),
+                (question.difficulty, centered, body_char),
+            ]
+            for column, (text, para_id, char_id) in enumerate(cells):
+                self._write([(text, char_id)], para_id=para_id,
+                            paragraph=table.cell(row, column).paragraphs[0])
+
+        unmapped = self.exam.unmapped_questions()
+        if unmapped:
+            note = "※ 성취기준 미판정: " + ", ".join(f"{n}번" for n in unmapped) + " — 확인 후 기입"
+            self._write(
+                [(note, self._char(size=8.5))],
+                para_id=self._para_fmt(line_spacing=130, before_pt=3.0),
             )
 
     # ------------------------------------------------------------------
@@ -394,6 +471,8 @@ class ExamRenderer:
 
         if self.include_answers:
             self._render_answer_key()
+        if self.include_spec_table:
+            self._render_spec_table()
 
         # 제목 블록 다음부터 다단으로 바꾼다
         if s.columns > 1 and first_question_para is not None:
@@ -410,6 +489,12 @@ class ExamRenderer:
 
 
 def render_exam(exam: Exam, path: str | Path, *, style: Style | None = None,
-                include_answers: bool = False) -> Path:
+                include_answers: bool = False, include_spec_table: bool = False,
+                standards=None) -> Path:
     """Exam을 HWPX 파일로 저장하고 경로를 돌려준다."""
-    return ExamRenderer(exam, style, include_answers=include_answers).render(path)
+    return ExamRenderer(
+        exam, style,
+        include_answers=include_answers,
+        include_spec_table=include_spec_table,
+        standards=standards,
+    ).render(path)
